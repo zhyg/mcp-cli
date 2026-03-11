@@ -1,404 +1,173 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// JSON-RPC 2.0 types for MCP protocol communication.
-
-type jsonRPCRequest struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int64       `json:"id"`
-	Method  string      `json:"method"`
-	Params  interface{} `json:"params,omitempty"`
-}
-
-type jsonRPCResponse struct {
-	JSONRPC string           `json:"jsonrpc"`
-	ID      *json.RawMessage `json:"id,omitempty"`
-	Result  json.RawMessage  `json:"result,omitempty"`
-	Error   *jsonRPCError    `json:"error,omitempty"`
-}
-
-type jsonRPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-// McpConnection represents a connection to an MCP server.
+// McpConnection wraps an MCP client session.
 type McpConnection struct {
-	transport    mcpTransport
-	instructions string
+	session *mcp.ClientSession
 }
 
-// mcpTransport is the interface for MCP transport implementations.
-type mcpTransport interface {
-	sendRequest(req *jsonRPCRequest) (*jsonRPCResponse, error)
-	close() error
-}
-
-// --- Stdio Transport ---
-
-type stdioTransport struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	reader *bufio.Reader
-	mu     sync.Mutex
-	nextID int64
-}
-
-func newStdioTransport(config *ServerConfig) (*stdioTransport, error) {
-	args := config.Args
-	cmd := exec.Command(config.Command, args...)
-
-	// Merge process env with config env
-	env := os.Environ()
-	for k, v := range config.Env {
-		env = append(env, fmt.Sprintf("%s=%s", k, v))
-	}
-	cmd.Env = env
-
-	if config.Cwd != "" {
-		cmd.Dir = config.Cwd
-	}
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stdin pipe: %w", err)
-	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
-	// Forward stderr
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start server process: %w", err)
-	}
-
-	return &stdioTransport{
-		cmd:    cmd,
-		stdin:  stdin,
-		reader: bufio.NewReader(stdout),
-		nextID: 1,
-	}, nil
-}
-
-func (t *stdioTransport) sendRequest(req *jsonRPCRequest) (*jsonRPCResponse, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	req.JSONRPC = "2.0"
-	if req.ID == 0 {
-		req.ID = atomic.AddInt64(&t.nextID, 1)
-	}
-
-	data, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	debugLog("stdio send: %s", string(data))
-
-	// Write request followed by newline
-	if _, err := t.stdin.Write(append(data, '\n')); err != nil {
-		return nil, fmt.Errorf("failed to write to server: %w", err)
-	}
-
-	// Read response line
-	line, err := t.reader.ReadBytes('\n')
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	debugLog("stdio recv: %s", strings.TrimSpace(string(line)))
-
-	var resp jsonRPCResponse
-	if err := json.Unmarshal(line, &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	return &resp, nil
-}
-
-func (t *stdioTransport) close() error {
-	t.stdin.Close()
-	return t.cmd.Process.Kill()
-}
-
-// --- HTTP Transport ---
-
-type httpTransport struct {
-	url     string
+// headerTransport is an http.RoundTripper that injects custom headers.
+type headerTransport struct {
+	base    http.RoundTripper
 	headers map[string]string
-	client  *http.Client
-	nextID  int64
-	mu      sync.Mutex
-
-	// Session tracking for Streamable HTTP
-	sessionID string
 }
 
-func newHTTPTransport(config *ServerConfig) *httpTransport {
-	timeout := time.Duration(getTimeoutMs()) * time.Millisecond
-	if config.Timeout > 0 {
-		timeout = time.Duration(config.Timeout) * time.Second
-	}
-
-	return &httpTransport{
-		url:     config.URL,
-		headers: config.Headers,
-		client: &http.Client{
-			Timeout: timeout,
-		},
-		nextID: 1,
-	}
-}
-
-func (t *httpTransport) sendRequest(req *jsonRPCRequest) (*jsonRPCResponse, error) {
-	t.mu.Lock()
-	req.JSONRPC = "2.0"
-	if req.ID == 0 {
-		req.ID = atomic.AddInt64(&t.nextID, 1)
-	}
-	t.mu.Unlock()
-
-	data, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	debugLog("http send: %s", string(data))
-
-	httpReq, err := http.NewRequest("POST", t.url, bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	for k, v := range t.headers {
-		httpReq.Header.Set(k, v)
+		req.Header.Set(k, v)
 	}
-	if t.sessionID != "" {
-		httpReq.Header.Set("Mcp-Session-Id", t.sessionID)
-	}
-
-	httpResp, err := t.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
-	}
-	defer httpResp.Body.Close()
-
-	// Save session ID if provided
-	if sid := httpResp.Header.Get("Mcp-Session-Id"); sid != "" {
-		t.sessionID = sid
-	}
-
-	if httpResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(httpResp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", httpResp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	contentType := httpResp.Header.Get("Content-Type")
-
-	// Handle SSE responses (text/event-stream)
-	if strings.HasPrefix(contentType, "text/event-stream") {
-		return t.parseSSEResponse(httpResp.Body)
-	}
-
-	// Standard JSON response
-	respBody, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	debugLog("http recv: %s", string(respBody))
-
-	var resp jsonRPCResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	return &resp, nil
+	return t.base.RoundTrip(req)
 }
 
-// parseSSEResponse reads a Server-Sent Events stream and returns the last JSON-RPC response.
-func (t *httpTransport) parseSSEResponse(body io.Reader) (*jsonRPCResponse, error) {
-	scanner := bufio.NewScanner(body)
-	var lastResponse *jsonRPCResponse
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
-			debugLog("sse recv: %s", data)
-
-			var resp jsonRPCResponse
-			if err := json.Unmarshal([]byte(data), &resp); err == nil {
-				lastResponse = &resp
-			}
-		}
-	}
-
-	if lastResponse == nil {
-		return nil, fmt.Errorf("no JSON-RPC response found in SSE stream")
-	}
-	return lastResponse, nil
-}
-
-func (t *httpTransport) close() error {
-	return nil
-}
-
-// --- Connection Management ---
-
-// connectToServer creates a connection to an MCP server.
+// connectToServer creates a connection to an MCP server using the official SDK.
 func connectToServer(serverName string, config *ServerConfig) (*McpConnection, error) {
-	var transport mcpTransport
-	var err error
+	ctx := context.Background()
+
+	client := mcp.NewClient(
+		&mcp.Implementation{Name: "mcp-cli", Version: Version},
+		nil,
+	)
+
+	var transport mcp.Transport
 
 	if config.IsHTTP() {
-		transport = newHTTPTransport(config)
-	} else {
-		transport, err = newStdioTransport(config)
-		if err != nil {
-			return nil, err
+		httpClient := &http.Client{}
+		if config.Timeout > 0 {
+			httpClient.Timeout = time.Duration(config.Timeout) * time.Second
+		} else {
+			httpClient.Timeout = time.Duration(getTimeoutMs()) * time.Millisecond
 		}
+		// Inject custom headers via a RoundTripper.
+		if len(config.Headers) > 0 {
+			httpClient.Transport = &headerTransport{
+				base:    http.DefaultTransport,
+				headers: config.Headers,
+			}
+		}
+		transport = &mcp.StreamableClientTransport{
+			Endpoint:   config.URL,
+			HTTPClient: httpClient,
+		}
+	} else {
+		cmd := exec.Command(config.Command, config.Args...)
+		// Merge process env with config env.
+		env := os.Environ()
+		for k, v := range config.Env {
+			env = append(env, fmt.Sprintf("%s=%s", k, v))
+		}
+		cmd.Env = env
+		if config.Cwd != "" {
+			cmd.Dir = config.Cwd
+		}
+		cmd.Stderr = os.Stderr
+		transport = &mcp.CommandTransport{Command: cmd}
 	}
 
-	conn := &McpConnection{
-		transport: transport,
-	}
-
-	// Initialize the MCP connection
-	if err := conn.initialize(); err != nil {
-		transport.close()
-		return nil, fmt.Errorf("MCP initialization failed: %w", err)
-	}
-
-	return conn, nil
-}
-
-// initialize performs the MCP initialize handshake.
-func (c *McpConnection) initialize() error {
-	req := &jsonRPCRequest{
-		Method: "initialize",
-		Params: map[string]interface{}{
-			"protocolVersion": "2024-11-05",
-			"capabilities":    map[string]interface{}{},
-			"clientInfo": map[string]interface{}{
-				"name":    "mcp-cli",
-				"version": Version,
-			},
-		},
-	}
-
-	resp, err := c.transport.sendRequest(req)
+	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {
-		return fmt.Errorf("initialize request failed: %w", err)
+		return nil, fmt.Errorf("MCP connection failed: %w", err)
 	}
 
-	if resp.Error != nil {
-		return fmt.Errorf("initialize error: %s", resp.Error.Message)
-	}
-
-	// Parse init result to get instructions
-	var initResult struct {
-		Instructions string `json:"instructions"`
-	}
-	if resp.Result != nil {
-		json.Unmarshal(resp.Result, &initResult)
-		c.instructions = initResult.Instructions
-	}
-
-	// Send initialized notification
-	notif := &jsonRPCRequest{
-		Method: "notifications/initialized",
-	}
-	// Notifications don't have IDs in JSON-RPC, but our transport always adds one.
-	// Send it anyway; the server should ignore the id field for notifications.
-	c.transport.sendRequest(notif)
-
-	return nil
+	return &McpConnection{session: session}, nil
 }
 
 // ListTools returns all tools from the MCP server.
 func (c *McpConnection) ListTools() ([]ToolInfo, error) {
-	req := &jsonRPCRequest{
-		Method: "tools/list",
-	}
+	ctx := context.Background()
+	var allTools []ToolInfo
 
-	resp, err := c.transport.sendRequest(req)
-	if err != nil {
-		return nil, fmt.Errorf("list tools failed: %w", err)
+	for tool, err := range c.session.Tools(ctx, nil) {
+		if err != nil {
+			return nil, fmt.Errorf("list tools failed: %w", err)
+		}
+		allTools = append(allTools, convertTool(tool))
 	}
+	return allTools, nil
+}
 
-	if resp.Error != nil {
-		return nil, fmt.Errorf("list tools error: %s", resp.Error.Message)
+// convertTool converts an *mcp.Tool to our ToolInfo display type.
+func convertTool(t *mcp.Tool) ToolInfo {
+	info := ToolInfo{
+		Name:        t.Name,
+		Description: t.Description,
 	}
-
-	var result struct {
-		Tools []ToolInfo `json:"tools"`
+	// Convert InputSchema (any) to map[string]interface{} via JSON round-trip.
+	if t.InputSchema != nil {
+		data, err := json.Marshal(t.InputSchema)
+		if err == nil {
+			var schema map[string]interface{}
+			if json.Unmarshal(data, &schema) == nil {
+				info.InputSchema = schema
+			}
+		}
 	}
-	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse tools: %w", err)
-	}
-
-	return result.Tools, nil
+	return info
 }
 
 // CallTool calls a tool with the given arguments.
 func (c *McpConnection) CallTool(toolName string, args map[string]interface{}) (interface{}, error) {
-	req := &jsonRPCRequest{
-		Method: "tools/call",
-		Params: map[string]interface{}{
-			"name":      toolName,
-			"arguments": args,
-		},
+	ctx := context.Background()
+	params := &mcp.CallToolParams{
+		Name:      toolName,
+		Arguments: args,
 	}
 
-	resp, err := c.transport.sendRequest(req)
+	res, err := c.session.CallTool(ctx, params)
 	if err != nil {
 		return nil, fmt.Errorf("call tool failed: %w", err)
 	}
 
-	if resp.Error != nil {
-		return nil, fmt.Errorf("%s", resp.Error.Message)
+	if res.IsError {
+		// Extract error text from content.
+		var errTexts []string
+		for _, c := range res.Content {
+			if tc, ok := c.(*mcp.TextContent); ok {
+				errTexts = append(errTexts, tc.Text)
+			}
+		}
+		if len(errTexts) > 0 {
+			return nil, fmt.Errorf("%s", strings.Join(errTexts, "\n"))
+		}
+		return nil, fmt.Errorf("tool execution failed")
 	}
 
+	// Convert the result to a generic interface for formatting.
+	data, err := json.Marshal(res)
+	if err != nil {
+		return res, nil
+	}
 	var result interface{}
-	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse result: %w", err)
+	if json.Unmarshal(data, &result) != nil {
+		return res, nil
 	}
-
 	return result, nil
 }
 
 // GetInstructions returns the server instructions from initialization.
 func (c *McpConnection) GetInstructions() string {
-	return c.instructions
+	if initResult := c.session.InitializeResult(); initResult != nil {
+		return initResult.Instructions
+	}
+	return ""
 }
 
 // Close closes the connection.
 func (c *McpConnection) Close() error {
-	return c.transport.close()
+	return c.session.Close()
 }
 
 // --- Retry Logic ---
