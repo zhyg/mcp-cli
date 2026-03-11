@@ -275,6 +275,37 @@ func loadConfig(configPath string) (*McpServersConfig, string, error) {
 		return nil, path, configMissingFieldError(path)
 	}
 
+	// Validate each server config
+	for name, server := range config.McpServers {
+		if server == nil {
+			return nil, path, &CliError{
+				Code:    ErrorCodeClientError,
+				Type:    "CONFIG_INVALID_SERVER",
+				Message: fmt.Sprintf("Invalid server configuration for %q: value is null", name),
+				Details: fmt.Sprintf("File: %s", path),
+				Suggestion: `Each server must have either "command" (stdio) or "url" (HTTP) field`,
+			}
+		}
+		if server.Command == "" && server.URL == "" {
+			return nil, path, &CliError{
+				Code:    ErrorCodeClientError,
+				Type:    "CONFIG_INVALID_SERVER",
+				Message: fmt.Sprintf("Server %q missing required field: must have either \"command\" or \"url\"", name),
+				Details: fmt.Sprintf("File: %s", path),
+				Suggestion: `Add "command" for stdio servers or "url" for HTTP servers`,
+			}
+		}
+		if server.Command != "" && server.URL != "" {
+			return nil, path, &CliError{
+				Code:    ErrorCodeClientError,
+				Type:    "CONFIG_INVALID_SERVER",
+				Message: fmt.Sprintf("Server %q has both \"command\" and \"url\" - pick one", name),
+				Details: fmt.Sprintf("File: %s", path),
+				Suggestion: `Use "command" for local stdio servers or "url" for remote HTTP servers, not both`,
+			}
+		}
+	}
+
 	// Substitute environment variables
 	if err := substituteEnvVarsInConfig(&config); err != nil {
 		return nil, path, &CliError{
