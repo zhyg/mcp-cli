@@ -92,13 +92,11 @@ func formatSearchResults(results []SearchResult, withDescriptions bool) string {
 	var lines []string
 
 	for _, r := range results {
-		server := colorize(r.Server, colorCyan)
-		tool := colorize(r.Tool.Name, colorGreen)
-		if r.Tool.Description != "" {
-			lines = append(lines, fmt.Sprintf("%s %s %s", server, tool, colorize(r.Tool.Description, colorDim)))
-		} else {
-			lines = append(lines, fmt.Sprintf("%s %s", server, tool))
+		entry := colorize(r.Server, colorCyan) + "/" + colorize(r.Tool.Name, colorGreen)
+		if withDescriptions && r.Tool.Description != "" {
+			entry += " - " + colorize(r.Tool.Description, colorDim)
 		}
+		lines = append(lines, entry)
 	}
 
 	return strings.Join(lines, "\n")
@@ -204,27 +202,8 @@ func formatToolSchema(serverName string, tool ToolInfo) string {
 	return strings.Join(lines, "\n")
 }
 
-// formatToolResult formats a tool call result for CLI output.
+// formatToolResult formats a tool call result for CLI output as raw JSON.
 func formatToolResult(result interface{}) string {
-	if m, ok := result.(map[string]interface{}); ok {
-		if content, ok := m["content"].([]interface{}); ok {
-			var textParts []string
-			for _, c := range content {
-				if cm, ok := c.(map[string]interface{}); ok {
-					if cm["type"] == "text" {
-						if text, ok := cm["text"].(string); ok {
-							textParts = append(textParts, text)
-						}
-					}
-				}
-			}
-			if len(textParts) > 0 {
-				return strings.Join(textParts, "\n")
-			}
-		}
-	}
-
-	// Fallback to JSON
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return fmt.Sprintf("%v", result)
