@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // --- List Command ---
@@ -91,12 +92,12 @@ func fetchServerTools(serverName string, config *McpServersConfig) serverResult 
 		return serverResult{name: serverName, err: err.Error()}
 	}
 
-	conn, err := connectWithRetry(serverName, serverConfig)
+	conn, err := getUnifiedConnection(serverName, serverConfig)
 	if err != nil {
 		debugLog("%s: connection failed - %s", serverName, err.Error())
 		return serverResult{name: serverName, err: err.Error()}
 	}
-	defer safeClose(conn)
+	defer conn.Close()
 
 	tools, err := conn.ListTools()
 	if err != nil {
@@ -132,12 +133,12 @@ func infoCommand(serverName, toolName, configPath string, withDescriptions bool)
 		os.Exit(ErrorCodeClientError)
 	}
 
-	conn, err := connectWithRetry(serverName, serverConfig)
+	conn, err := getUnifiedConnection(serverName, serverConfig)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, formatCliError(serverConnectionError(serverName, err.Error())))
 		os.Exit(ErrorCodeNetworkError)
 	}
-	defer safeClose(conn)
+	defer conn.Close()
 
 	tools, err := conn.ListTools()
 	if err != nil {
@@ -261,13 +262,13 @@ func grepCommand(pattern, configPath string, withDescriptions bool) {
 				return
 			}
 
-			conn, err := connectWithRetry(serverName, serverConfig)
+			conn, err := getUnifiedConnection(serverName, serverConfig)
 			if err != nil {
 				debugLog("%s: connection failed - %s", serverName, err.Error())
 				allSearchResults[idx] = searchResult{serverName: serverName, err: err.Error()}
 				return
 			}
-			defer safeClose(conn)
+			defer conn.Close()
 
 			tools, err := conn.ListTools()
 			if err != nil {
@@ -341,12 +342,18 @@ func callCommand(serverName, toolName, argsStr, configPath string) {
 		os.Exit(ErrorCodeClientError)
 	}
 
-	conn, err := connectWithRetry(serverName, serverConfig)
+	// Check if tool is allowed before calling
+	if !isToolAllowed(toolName, serverConfig) {
+		fmt.Fprintln(os.Stderr, formatCliError(toolDisabledError(toolName, serverName)))
+		os.Exit(ErrorCodeClientError)
+	}
+
+	conn, err := getUnifiedConnection(serverName, serverConfig)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, formatCliError(serverConnectionError(serverName, err.Error())))
 		os.Exit(ErrorCodeNetworkError)
 	}
-	defer safeClose(conn)
+	defer conn.Close()
 
 	result, err := conn.CallTool(toolName, args)
 	if err != nil {
@@ -380,11 +387,25 @@ func parseCallArgs(argsStr string) (map[string]interface{}, error) {
 		// Check if stdin has data (not a terminal)
 		stat, _ := os.Stdin.Stat()
 		if (stat.Mode() & os.ModeCharDevice) == 0 {
-			data, err := io.ReadAll(os.Stdin)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read from stdin: %w", err)
+			timeoutMs := getTimeoutMs()
+			type readResult struct {
+				data []byte
+				err  error
 			}
-			jsonString = strings.TrimSpace(string(data))
+			ch := make(chan readResult, 1)
+			go func() {
+				data, err := io.ReadAll(os.Stdin)
+				ch <- readResult{data, err}
+			}()
+			select {
+			case result := <-ch:
+				if result.err != nil {
+					return nil, fmt.Errorf("failed to read from stdin: %w", result.err)
+				}
+				jsonString = strings.TrimSpace(string(result.data))
+			case <-time.After(time.Duration(timeoutMs) * time.Millisecond):
+				return nil, fmt.Errorf("stdin read timed out after %dms", timeoutMs)
+			}
 		}
 	}
 

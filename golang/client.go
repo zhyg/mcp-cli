@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,14 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// Connection is the unified interface for both direct and daemon connections.
+type Connection interface {
+	ListTools() ([]ToolInfo, error)
+	CallTool(toolName string, args map[string]interface{}) (interface{}, error)
+	GetInstructions() string
+	Close() error
+}
 
 // McpConnection wraps an MCP client session.
 type McpConnection struct {
@@ -73,7 +82,18 @@ func connectToServer(serverName string, config *ServerConfig) (*McpConnection, e
 		if config.Cwd != "" {
 			cmd.Dir = config.Cwd
 		}
-		cmd.Stderr = os.Stderr
+		// Pipe stderr and prefix with [serverName]
+		stderrPipe, err := cmd.StderrPipe()
+		if err != nil {
+			cmd.Stderr = os.Stderr
+		} else {
+			go func() {
+				scanner := bufio.NewScanner(stderrPipe)
+				for scanner.Scan() {
+					fmt.Fprintf(os.Stderr, "[%s] %s\n", serverName, scanner.Text())
+				}
+			}()
+		}
 		transport = &mcp.CommandTransport{Command: cmd}
 	}
 

@@ -210,12 +210,42 @@ func invalidJSONArgsError(input, parseError string) *CliError {
 	}
 }
 
+func toolDisabledError(toolName, serverName string) *CliError {
+	return &CliError{
+		Code:       ErrorCodeClientError,
+		Type:       "TOOL_DISABLED",
+		Message:    fmt.Sprintf("Tool %q is disabled by configuration", toolName),
+		Details:    fmt.Sprintf("Server %q has allowedTools/disabledTools filtering configured", serverName),
+		Suggestion: fmt.Sprintf("Check your mcp_servers.json config. Remove %q from disabledTools or add it to allowedTools.", toolName),
+	}
+}
+
 func unknownOptionError(option string) *CliError {
+	optionLower := strings.ToLower(strings.TrimLeft(option, "-"))
+	var suggestion string
+
+	switch {
+	case optionLower == "server" || optionLower == "s":
+		suggestion = "Server is a positional argument. Use 'mcp-cli info <server>'"
+	case optionLower == "tool" || optionLower == "t":
+		suggestion = "Tool is a positional argument. Use 'mcp-cli call <server> <tool>'"
+	case optionLower == "args" || optionLower == "arguments" || optionLower == "a" || optionLower == "input":
+		suggestion = `Pass JSON directly: 'mcp-cli call <server> <tool> '{"key": "value"}''`
+	case optionLower == "pattern" || optionLower == "p" || optionLower == "search" || optionLower == "query":
+		suggestion = `Use 'mcp-cli grep "*pattern*"'`
+	case optionLower == "call" || optionLower == "run" || optionLower == "exec":
+		suggestion = "Use 'call' as a subcommand, not option: 'mcp-cli call <server> <tool>'"
+	case optionLower == "info" || optionLower == "list" || optionLower == "get":
+		suggestion = "Use 'info' as a subcommand, not option: 'mcp-cli info <server>'"
+	default:
+		suggestion = "Valid options: -c/--config, -d/--with-descriptions"
+	}
+
 	return &CliError{
 		Code:       ErrorCodeClientError,
 		Type:       "UNKNOWN_OPTION",
 		Message:    fmt.Sprintf("Unknown option: %s", option),
-		Suggestion: "Valid options: -c/--config, -d/--with-descriptions",
+		Suggestion: suggestion,
 	}
 }
 
@@ -241,17 +271,33 @@ func tooManyArgumentsError(command string, got, expected int) *CliError {
 	return &CliError{
 		Code:       ErrorCodeClientError,
 		Type:       "TOO_MANY_ARGUMENTS",
-		Message:    fmt.Sprintf("Too many arguments for %s: got %d, expected %d", command, got, expected),
-		Suggestion: "Run 'mcp-cli --help' for usage examples",
+		Message:    fmt.Sprintf("Too many arguments for %s", command),
+		Details:    fmt.Sprintf("Received %d arguments, maximum is %d", got, expected),
+		Suggestion: "Run 'mcp-cli --help' for correct usage",
 	}
 }
 
 func unknownSubcommandError(subcommand string) *CliError {
+	suggestions := map[string]string{
+		"run": "call", "execute": "call", "exec": "call", "invoke": "call",
+		"list": "info", "ls": "info", "get": "info", "show": "info", "describe": "info",
+		"search": "grep", "find": "grep", "query": "grep",
+	}
+
+	suggested := suggestions[strings.ToLower(subcommand)]
+	validCommands := "info, grep, call"
+
+	suggestion := "Use 'mcp-cli --help' to see available commands"
+	if suggested != "" {
+		suggestion = fmt.Sprintf("Did you mean 'mcp-cli %s'?", suggested)
+	}
+
 	return &CliError{
 		Code:       ErrorCodeClientError,
 		Type:       "UNKNOWN_SUBCOMMAND",
 		Message:    fmt.Sprintf("Unknown subcommand: %q", subcommand),
-		Suggestion: "Valid subcommands: info, grep, call. Run 'mcp-cli --help' for usage.",
+		Details:    fmt.Sprintf("Valid subcommands: %s", validCommands),
+		Suggestion: suggestion,
 	}
 }
 
@@ -260,10 +306,15 @@ func ambiguousCommandError(serverName, toolName string, hasArgs bool) *CliError 
 	if hasArgs {
 		cmd += " '<json>'"
 	}
+	details := fmt.Sprintf("Received: mcp-cli %s %s", serverName, toolName)
+	if hasArgs {
+		details += " ..."
+	}
 	return &CliError{
 		Code:       ErrorCodeClientError,
 		Type:       "AMBIGUOUS_COMMAND",
-		Message:    fmt.Sprintf("Ambiguous command: did you mean 'info' or 'call'?"),
-		Suggestion: fmt.Sprintf("Be explicit: 'mcp-cli info %s %s' or '%s'", serverName, toolName, cmd),
+		Message:    "Ambiguous command: did you mean to call a tool or view info?",
+		Details:    details,
+		Suggestion: fmt.Sprintf("Use '%s' to execute, or 'mcp-cli info %s %s' to view schema", cmd, serverName, toolName),
 	}
 }

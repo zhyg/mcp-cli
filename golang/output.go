@@ -88,15 +88,18 @@ type SearchResult struct {
 }
 
 // formatSearchResults formats grep search results.
+// Always shows description if available (grep is for discovery).
 func formatSearchResults(results []SearchResult, withDescriptions bool) string {
 	var lines []string
 
 	for _, r := range results {
-		entry := colorize(r.Server, colorCyan) + "/" + colorize(r.Tool.Name, colorGreen)
-		if withDescriptions && r.Tool.Description != "" {
-			entry += " - " + colorize(r.Tool.Description, colorDim)
+		server := colorize(r.Server, colorCyan)
+		tool := colorize(r.Tool.Name, colorGreen)
+		if r.Tool.Description != "" {
+			lines = append(lines, fmt.Sprintf("%s %s %s", server, tool, colorize(r.Tool.Description, colorDim)))
+		} else {
+			lines = append(lines, fmt.Sprintf("%s %s", server, tool))
 		}
-		lines = append(lines, entry)
 	}
 
 	return strings.Join(lines, "\n")

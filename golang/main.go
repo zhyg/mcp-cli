@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
 // Known subcommands.
@@ -266,25 +268,47 @@ Examples:
   cat input.json | mcp-cli call server tool      # Read from stdin
 
 Environment Variables:
-  MCP_CONFIG_PATH   Path to config file
-  MCP_DEBUG         Enable debug output (default: false)
-  MCP_TIMEOUT       Request timeout in seconds (default: 1800)
-  MCP_CONCURRENCY   Max parallel connections (default: 5)
-  MCP_MAX_RETRIES   Max retry attempts (default: 3)
-  MCP_RETRY_DELAY   Base retry delay in ms (default: 1000)
-  MCP_STRICT_ENV    Error on missing env vars (default: true)
-  NO_COLOR          Disable colored output
+  MCP_NO_DAEMON=1        Disable connection caching (force fresh connections)
+  MCP_DAEMON_TIMEOUT=N   Set daemon idle timeout in seconds (default: 60)
+  MCP_CONFIG_PATH        Path to config file
+  MCP_DEBUG              Enable debug output (default: false)
+  MCP_TIMEOUT            Request timeout in seconds (default: 1800)
+  MCP_CONCURRENCY        Max parallel connections (default: 5)
+  MCP_MAX_RETRIES        Max retry attempts (default: 3)
+  MCP_RETRY_DELAY        Base retry delay in ms (default: 1000)
+  MCP_STRICT_ENV         Error on missing env vars (default: true)
+  NO_COLOR               Disable colored output
 `, Version)
 }
 
 func main() {
+	// Handle daemon mode (--daemon flag from spawned daemon process)
+	args := os.Args[1:]
+	if len(args) >= 3 && args[0] == "--daemon" {
+		daemonMain(args[1], args[2])
+		return
+	}
+
+	// Handle graceful shutdown on SIGINT/SIGTERM
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		switch sig {
+		case syscall.SIGINT:
+			os.Exit(130) // 128 + SIGINT(2)
+		case syscall.SIGTERM:
+			os.Exit(143) // 128 + SIGTERM(15)
+		}
+	}()
+
 	parsed := parseArgs(os.Args[1:])
 
 	switch parsed.Command {
 	case "help":
 		printHelp()
 	case "version":
-		fmt.Println(Version)
+		fmt.Printf("mcp-cli v%s\n", Version)
 	case "list":
 		listCommand(parsed.ConfigPath, parsed.WithDescriptions)
 	case "info":

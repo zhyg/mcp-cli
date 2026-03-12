@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,10 +16,11 @@ const Version = "0.3.0"
 
 // Default configuration values.
 const (
-	DefaultTimeoutSeconds = 1800 // 30 minutes
-	DefaultConcurrency    = 5
-	DefaultMaxRetries     = 3
-	DefaultRetryDelayMs   = 1000 // 1 second
+	DefaultTimeoutSeconds       = 1800 // 30 minutes
+	DefaultConcurrency          = 5
+	DefaultMaxRetries           = 3
+	DefaultRetryDelayMs         = 1000 // 1 second
+	DefaultDaemonTimeoutSeconds = 60   // 60 seconds idle timeout
 )
 
 // ServerConfig represents a server configuration entry.
@@ -166,6 +168,44 @@ func getRetryDelayMs() int {
 		}
 	}
 	return DefaultRetryDelayMs
+}
+
+// isDaemonEnabled returns true if daemon mode is enabled.
+func isDaemonEnabled() bool {
+	return os.Getenv("MCP_NO_DAEMON") != "1"
+}
+
+// getDaemonTimeoutMs returns configured daemon idle timeout in milliseconds.
+func getDaemonTimeoutMs() int {
+	if v := os.Getenv("MCP_DAEMON_TIMEOUT"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return secs * 1000
+		}
+	}
+	return DefaultDaemonTimeoutSeconds * 1000
+}
+
+// getSocketDir returns the socket directory for daemon connections.
+func getSocketDir() string {
+	uid := os.Getuid()
+	return filepath.Join("/tmp", fmt.Sprintf("mcp-cli-%d", uid))
+}
+
+// getSocketPath returns socket path for a specific server.
+func getSocketPath(serverName string) string {
+	return filepath.Join(getSocketDir(), serverName+".sock")
+}
+
+// getPidPath returns PID file path for a specific server daemon.
+func getPidPath(serverName string) string {
+	return filepath.Join(getSocketDir(), serverName+".pid")
+}
+
+// getConfigHash generates a hash of server config for stale detection.
+func getConfigHash(config *ServerConfig) string {
+	data, _ := json.Marshal(config)
+	h := sha256.Sum256(data)
+	return fmt.Sprintf("%x", h[:8])
 }
 
 // isStrictEnvMode returns true if strict env var mode is enabled.
