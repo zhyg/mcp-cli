@@ -1,5 +1,5 @@
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -12,8 +12,9 @@ pub const DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
 pub const DEFAULT_CONCURRENCY: usize = 5;
 pub const DEFAULT_MAX_RETRIES: usize = 3;
 pub const DEFAULT_RETRY_DELAY_MS: u64 = 1000;
+pub const DEFAULT_DAEMON_TIMEOUT_SECONDS: u64 = 60;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default)]
     pub command: Option<String>,
@@ -36,7 +37,6 @@ pub struct ServerConfig {
     pub disabled_tools: Option<Vec<String>>,
 }
 
-#[allow(dead_code)]
 impl ServerConfig {
     pub fn is_http(&self) -> bool {
         self.url.is_some()
@@ -343,7 +343,6 @@ pub fn filter_tools(tools: Vec<ToolInfo>, config: &ServerConfig) -> Vec<ToolInfo
         .collect()
 }
 
-#[allow(dead_code)]
 pub fn is_tool_allowed(tool_name: &str, config: &ServerConfig) -> bool {
     let disabled = config.disabled_tools.as_deref().unwrap_or(&[]);
     let allowed = config.allowed_tools.as_deref().unwrap_or(&[]);
@@ -355,6 +354,45 @@ pub fn is_tool_allowed(tool_name: &str, config: &ServerConfig) -> bool {
         return false;
     }
     true
+}
+
+// --- Daemon Configuration ---
+
+pub fn is_daemon_enabled() -> bool {
+    env::var("MCP_NO_DAEMON").map(|v| v != "1").unwrap_or(true)
+}
+
+pub fn get_daemon_timeout_ms() -> u64 {
+    if let Ok(v) = env::var("MCP_DAEMON_TIMEOUT") {
+        if let Ok(secs) = v.parse::<u64>() {
+            if secs > 0 {
+                return secs * 1000;
+            }
+        }
+    }
+    DEFAULT_DAEMON_TIMEOUT_SECONDS * 1000
+}
+
+pub fn get_socket_dir() -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/mcp-cli-{}", uid))
+}
+
+pub fn get_socket_path(server_name: &str) -> PathBuf {
+    get_socket_dir().join(format!("{}.sock", server_name))
+}
+
+pub fn get_pid_path(server_name: &str) -> PathBuf {
+    get_socket_dir().join(format!("{}.pid", server_name))
+}
+
+pub fn get_config_hash(config: &ServerConfig) -> String {
+    let value = serde_json::to_value(config).unwrap_or_default();
+    let s = value.to_string();
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 #[cfg(test)]

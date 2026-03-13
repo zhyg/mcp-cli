@@ -1,12 +1,15 @@
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation};
 use rmcp::service::RunningService;
 use rmcp::transport::{TokioChildProcess, StreamableHttpClientTransport};
 use rmcp::{RoleClient, ServiceExt};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::config::*;
+use crate::daemon_client::*;
 use crate::errors::*;
 
 pub async fn connect_to_server(
@@ -47,8 +50,28 @@ pub async fn connect_to_server(
             command.current_dir(cwd);
         }
 
-        let transport = TokioChildProcess::new(command)
+        let (transport, stderr_handle) = TokioChildProcess::builder(command)
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| server_connection_error(server_name, &e.to_string()))?;
+
+        // Forward stderr from child process with [serverName] prefix
+        if let Some(mut stderr) = stderr_handle {
+            let sn = server_name.to_string();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let text = String::from_utf8_lossy(&buf[..n]);
+                            eprint!("[{}] {}", sn, text);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
 
         let service = client_info
             .serve(transport)
@@ -242,6 +265,93 @@ fn rand_f64() -> f64 {
         .unwrap_or_default()
         .subsec_nanos();
     (nanos as f64) / (u32::MAX as f64)
+}
+
+// --- Unified Connection ---
+
+enum ConnectionKind {
+    Direct(RunningService<RoleClient, ClientInfo>),
+    Daemon(DaemonConnection),
+}
+
+pub struct McpConnection {
+    inner: ConnectionKind,
+    server_config: ServerConfig,
+    server_name: String,
+}
+
+impl McpConnection {
+    pub async fn list_tools(&self) -> Result<Vec<ToolInfo>, CliError> {
+        let tools = match &self.inner {
+            ConnectionKind::Direct(client) => list_tools_from_client(client).await?,
+            ConnectionKind::Daemon(conn) => conn.list_tools().await?,
+        };
+        Ok(filter_tools(tools, &self.server_config))
+    }
+
+    pub async fn call_tool(
+        &self,
+        tool_name: &str,
+        args: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Value, CliError> {
+        if !is_tool_allowed(tool_name, &self.server_config) {
+            return Err(tool_disabled_error(tool_name, &self.server_name));
+        }
+        match &self.inner {
+            ConnectionKind::Direct(client) => call_tool_on_client(client, tool_name, args).await,
+            ConnectionKind::Daemon(conn) => conn.call_tool(tool_name, args).await,
+        }
+    }
+
+    pub async fn get_instructions_async(&self) -> Option<String> {
+        match &self.inner {
+            ConnectionKind::Direct(client) => get_instructions(client),
+            ConnectionKind::Daemon(conn) => conn.get_instructions().await.ok().flatten(),
+        }
+    }
+
+    pub async fn close(self) {
+        match self.inner {
+            ConnectionKind::Direct(client) => safe_close(client).await,
+            ConnectionKind::Daemon(conn) => conn.close().await,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_daemon(&self) -> bool {
+        matches!(self.inner, ConnectionKind::Daemon(_))
+    }
+}
+
+pub async fn get_connection(
+    server_name: &str,
+    config: &ServerConfig,
+) -> Result<McpConnection, CliError> {
+    cleanup_orphaned_daemons().await;
+
+    if is_daemon_enabled() && config.is_stdio() {
+        match get_daemon_connection(server_name, config).await {
+            Some(conn) => {
+                debug_log(&format!("Using daemon connection for {}", server_name));
+                return Ok(McpConnection {
+                    inner: ConnectionKind::Daemon(conn),
+                    server_config: config.clone(),
+                    server_name: server_name.to_string(),
+                });
+            }
+            None => {
+                debug_log(&format!("Daemon connection failed for {}, falling back to direct", server_name));
+            }
+        }
+    }
+
+    debug_log(&format!("Using direct connection for {}", server_name));
+    let client = connect_with_retry(server_name, config).await?;
+    Ok(McpConnection {
+        inner: ConnectionKind::Direct(client),
+        server_config: config.clone(),
+        server_name: server_name.to_string(),
+    })
 }
 
 #[cfg(test)]

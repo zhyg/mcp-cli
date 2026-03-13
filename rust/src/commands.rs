@@ -104,7 +104,7 @@ async fn fetch_server_tools(server_name: &str, config: &McpServersConfig) -> Ser
         },
     };
 
-    let client = match connect_with_retry(server_name, server_config).await {
+    let connection = match get_connection(server_name, server_config).await {
         Ok(c) => c,
         Err(e) => {
             debug_log(&format!("{}: connection failed - {}", server_name, e.message));
@@ -117,10 +117,10 @@ async fn fetch_server_tools(server_name: &str, config: &McpServersConfig) -> Ser
         }
     };
 
-    let tools = match list_tools_from_client(&client).await {
+    let tools = match connection.list_tools().await {
         Ok(t) => t,
         Err(e) => {
-            safe_close(client).await;
+            connection.close().await;
             return ServerResult {
                 name: server_name.to_string(),
                 tools: Vec::new(),
@@ -130,11 +130,10 @@ async fn fetch_server_tools(server_name: &str, config: &McpServersConfig) -> Ser
         }
     };
 
-    let tools = filter_tools(tools, server_config);
-    let instructions = get_instructions(&client);
+    let instructions = connection.get_instructions_async().await;
     debug_log(&format!("{}: loaded {} tools", server_name, tools.len()));
 
-    safe_close(client).await;
+    connection.close().await;
 
     ServerResult {
         name: server_name.to_string(),
@@ -155,16 +154,16 @@ pub async fn info_command(
     let (config, _) = load_config(config_path)?;
     let server_config = get_server_config(&config, server_name)?;
 
-    let client = connect_with_retry(server_name, server_config).await
+    let connection = get_connection(server_name, server_config).await
         .map_err(|e| {
             eprintln!("{}", format_cli_error(&server_connection_error(server_name, &e.message)));
             e
         })?;
 
-    let tools = match list_tools_from_client(&client).await {
-        Ok(t) => filter_tools(t, server_config),
+    let tools = match connection.list_tools().await {
+        Ok(t) => t,
         Err(e) => {
-            safe_close(client).await;
+            connection.close().await;
             return Err(e);
         }
     };
@@ -177,12 +176,12 @@ pub async fn info_command(
             }
             None => {
                 let available: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
-                safe_close(client).await;
+                connection.close().await;
                 return Err(tool_not_found_error(tool, server_name, &available));
             }
         }
     } else {
-        let instructions = get_instructions(&client);
+        let instructions = connection.get_instructions_async().await;
         println!("{}", format_server_details(
             server_name,
             server_config,
@@ -192,7 +191,7 @@ pub async fn info_command(
         ));
     }
 
-    safe_close(client).await;
+    connection.close().await;
     Ok(())
 }
 
@@ -304,12 +303,12 @@ pub async fn call_command(
 
     let args = parse_call_args(args_str)?;
 
-    let client = connect_with_retry(server_name, server_config).await?;
+    let connection = get_connection(server_name, server_config).await?;
 
-    match call_tool_on_client(&client, tool_name, args).await {
+    match connection.call_tool(tool_name, args).await {
         Ok(result) => {
             println!("{}", format_tool_result(&result));
-            safe_close(client).await;
+            connection.close().await;
             Ok(())
         }
         Err(e) => {
@@ -317,13 +316,13 @@ pub async fn call_command(
 
             if err_msg.contains("not found") || err_msg.contains("unknown tool") {
                 let mut available = Vec::new();
-                if let Ok(tools) = list_tools_from_client(&client).await {
+                if let Ok(tools) = connection.list_tools().await {
                     available = tools.iter().map(|t| t.name.clone()).collect();
                 }
-                safe_close(client).await;
+                connection.close().await;
                 Err(tool_not_found_error(tool_name, server_name, &available))
             } else {
-                safe_close(client).await;
+                connection.close().await;
                 Err(tool_execution_error(tool_name, server_name, &err_msg))
             }
         }

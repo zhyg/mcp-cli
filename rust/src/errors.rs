@@ -166,6 +166,16 @@ pub fn tool_execution_error(tool_name: &str, server_name: &str, cause: &str) -> 
     }
 }
 
+pub fn tool_disabled_error(tool_name: &str, server_name: &str) -> CliError {
+    CliError {
+        code: ERROR_CODE_CLIENT_ERROR,
+        error_type: "TOOL_DISABLED".to_string(),
+        message: format!("Tool {:?} is disabled by configuration", tool_name),
+        details: Some(format!("Server {:?} has allowedTools/disabledTools filtering configured", server_name)),
+        suggestion: Some("Check the server's allowedTools/disabledTools configuration".to_string()),
+    }
+}
+
 pub fn invalid_json_args_error(input: &str, parse_error: &str) -> CliError {
     let truncated = if input.len() > 100 {
         format!("{}...", &input[..100])

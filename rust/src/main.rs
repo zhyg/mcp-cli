@@ -1,6 +1,8 @@
 mod client;
 mod commands;
 mod config;
+mod daemon;
+mod daemon_client;
 mod errors;
 mod output;
 
@@ -260,6 +262,8 @@ Environment Variables:
   MCP_MAX_RETRIES   Max retry attempts (default: 3)
   MCP_RETRY_DELAY   Base retry delay in ms (default: 1000)
   MCP_STRICT_ENV    Error on missing env vars (default: true)
+  MCP_NO_DAEMON     Disable daemon mode (default: false, set to 1)
+  MCP_DAEMON_TIMEOUT  Daemon idle timeout in seconds (default: 60)
   NO_COLOR          Disable colored output
 "#, VERSION);
 }
@@ -267,6 +271,29 @@ Environment Variables:
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Handle daemon mode
+    if args.first().map(|a| a.as_str()) == Some("--daemon") {
+        let server_name = args.get(1).cloned().unwrap_or_default();
+        let config_json = args.get(2).cloned().unwrap_or_default();
+
+        if server_name.is_empty() || config_json.is_empty() {
+            eprintln!("Usage: mcp-cli --daemon <serverName> <configJson>");
+            std::process::exit(1);
+        }
+
+        let server_config: config::ServerConfig = match serde_json::from_str(&config_json) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Invalid config JSON: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        daemon::run_daemon(&server_name, server_config).await;
+        return;
+    }
+
     let parsed = parse_args(args);
 
     let exit_code = match parsed.command.as_str() {
