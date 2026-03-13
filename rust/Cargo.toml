@@ -1,0 +1,26 @@
+[package]
+name = "mcp-cli"
+version = "0.3.0"
+edition = "2024"
+description = "A lightweight CLI for interacting with MCP (Model Context Protocol) servers"
+license = "MIT"
+
+[[bin]]
+name = "mcp-cli"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "1.2.0", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+atty = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
