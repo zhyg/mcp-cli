@@ -29,6 +29,7 @@ go.work.sum
 
 # Build output
 golang/mcp-cli
+bin/
 
 # Editor/IDE
 # .idea/
