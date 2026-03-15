@@ -243,53 +243,59 @@ func substituteEnvVars(value string) (string, error) {
 	return result, nil
 }
 
-// substituteEnvVarsInConfig processes env var substitution for all string values in a config.
-func substituteEnvVarsInConfig(config *McpServersConfig) error {
-	for name, server := range config.McpServers {
-		if server.Command != "" {
-			v, err := substituteEnvVars(server.Command)
+// substituteEnvVarsInObject recursively substitutes ${VAR} patterns in all string values.
+func substituteEnvVarsInObject(v interface{}) (interface{}, error) {
+	switch val := v.(type) {
+	case string:
+		return substituteEnvVars(val)
+	case []interface{}:
+		result := make([]interface{}, len(val))
+		for i, item := range val {
+			substituted, err := substituteEnvVarsInObject(item)
 			if err != nil {
-				return fmt.Errorf("server %q command: %w", name, err)
+				return nil, err
 			}
-			server.Command = v
+			result[i] = substituted
 		}
-		for i, arg := range server.Args {
-			v, err := substituteEnvVars(arg)
+		return result, nil
+	case map[string]interface{}:
+		result := make(map[string]interface{}, len(val))
+		for k, item := range val {
+			substituted, err := substituteEnvVarsInObject(item)
 			if err != nil {
-				return fmt.Errorf("server %q args[%d]: %w", name, i, err)
+				return nil, err
 			}
-			server.Args[i] = v
+			result[k] = substituted
 		}
-		for key, val := range server.Env {
-			v, err := substituteEnvVars(val)
-			if err != nil {
-				return fmt.Errorf("server %q env[%s]: %w", name, key, err)
-			}
-			server.Env[key] = v
-		}
-		if server.URL != "" {
-			v, err := substituteEnvVars(server.URL)
-			if err != nil {
-				return fmt.Errorf("server %q url: %w", name, err)
-			}
-			server.URL = v
-		}
-		for key, val := range server.Headers {
-			v, err := substituteEnvVars(val)
-			if err != nil {
-				return fmt.Errorf("server %q headers[%s]: %w", name, key, err)
-			}
-			server.Headers[key] = v
-		}
-		if server.Cwd != "" {
-			v, err := substituteEnvVars(server.Cwd)
-			if err != nil {
-				return fmt.Errorf("server %q cwd: %w", name, err)
-			}
-			server.Cwd = v
-		}
+		return result, nil
+	default:
+		return v, nil
 	}
-	return nil
+}
+
+// substituteEnvVarsInConfig recursively processes env var substitution for all string values in a config.
+func substituteEnvVarsInConfig(config *McpServersConfig) error {
+	data, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+
+	var raw interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	substituted, err := substituteEnvVarsInObject(raw)
+	if err != nil {
+		return err
+	}
+
+	data, err = json.Marshal(substituted)
+	if err != nil {
+		return err
+	}
+
+	return json.Unmarshal(data, config)
 }
 
 // --- Config Loading ---
@@ -311,8 +317,12 @@ func loadConfig(configPath string) (*McpServersConfig, string, error) {
 		return nil, path, configInvalidJSONError(path, err.Error())
 	}
 
-	if config.McpServers == nil || len(config.McpServers) == 0 {
+	if config.McpServers == nil {
 		return nil, path, configMissingFieldError(path)
+	}
+
+	if len(config.McpServers) == 0 {
+		fmt.Fprintln(os.Stderr, "[mcp-cli] Warning: No servers configured in mcpServers. Add server configurations to use MCP tools.")
 	}
 
 	// Validate each server config
