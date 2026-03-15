@@ -766,6 +766,7 @@ name = "mcp-cli"
 version = "0.3.0"
 dependencies = [
  "atty",
+ "http",
  "libc",
  "regex",
  "rmcp",
