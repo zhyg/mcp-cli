@@ -176,6 +176,7 @@ pub fn format_tool_schema(server_name: &str, tool: &ToolInfo) -> String {
     lines.join("\n")
 }
 
+#[allow(dead_code)]
 pub fn format_tool_result(result: &serde_json::Value) -> String {
     if let Some(content) = result.get("content").and_then(|v| v.as_array()) {
         let text_parts: Vec<&str> = content

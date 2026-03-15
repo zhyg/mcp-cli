@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation};
 use rmcp::service::RunningService;
 use rmcp::transport::{TokioChildProcess, StreamableHttpClientTransport};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{RoleClient, ServiceExt};
+use http::{HeaderName, HeaderValue};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -25,7 +28,21 @@ pub async fn connect_to_server(
         let url = config.url.as_deref().unwrap();
         debug_log(&format!("{}: connecting via HTTP to {}", server_name, url));
 
-        let transport = StreamableHttpClientTransport::from_uri(url);
+        let mut custom_headers = HashMap::new();
+        if let Some(ref headers_map) = config.headers {
+            for (k, v) in headers_map {
+                if let (Ok(name), Ok(value)) = (
+                    HeaderName::try_from(k.as_str()),
+                    HeaderValue::from_str(v),
+                ) {
+                    custom_headers.insert(name, value);
+                }
+            }
+        }
+
+        let transport_config = StreamableHttpClientTransportConfig::with_uri(url)
+            .custom_headers(custom_headers);
+        let transport = StreamableHttpClientTransport::from_config(transport_config);
 
         let service = client_info
             .serve(transport)
@@ -82,31 +99,89 @@ pub async fn connect_to_server(
     }
 }
 
+async fn with_retry<F, Fut, T>(
+    operation_name: &str,
+    mut f: F,
+) -> Result<T, CliError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CliError>>,
+{
+    let max_retries = get_max_retries();
+    let base_delay = get_retry_delay_ms();
+    let total_budget_ms = get_timeout_ms();
+    let start = Instant::now();
+
+    let mut last_err = None;
+
+    for attempt in 0..=max_retries {
+        let elapsed = start.elapsed().as_millis() as u64;
+        if elapsed >= total_budget_ms {
+            debug_log(&format!("{}: timeout budget exhausted after {}ms", operation_name, elapsed));
+            break;
+        }
+
+        match f().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                let remaining = total_budget_ms.saturating_sub(start.elapsed().as_millis() as u64);
+                let should_retry = attempt < max_retries
+                    && is_transient_error(&e.message)
+                    && remaining > 1000;
+
+                if should_retry {
+                    let delay = calculate_backoff_delay(attempt, base_delay).min(remaining - 1000);
+                    debug_log(&format!(
+                        "{} failed (attempt {}/{}): {}. Retrying in {}ms...",
+                        operation_name, attempt + 1, max_retries + 1, e.message, delay
+                    ));
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+
+                last_err = Some(e);
+                if !should_retry && attempt > 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| CliError {
+        code: ERROR_CODE_SERVER_ERROR,
+        error_type: "OPERATION_FAILED".to_string(),
+        message: format!("{} failed", operation_name),
+        details: None,
+        suggestion: None,
+    }))
+}
+
 pub async fn list_tools_from_client(
     client: &RunningService<RoleClient, ClientInfo>,
 ) -> Result<Vec<ToolInfo>, CliError> {
-    let tools = client
-        .list_all_tools()
-        .await
-        .map_err(|e| CliError {
-            code: ERROR_CODE_SERVER_ERROR,
-            error_type: "LIST_TOOLS_FAILED".to_string(),
-            message: format!("Failed to list tools: {}", e),
-            details: None,
-            suggestion: None,
-        })?;
+    with_retry("list tools", || async {
+        let tools = client
+            .list_all_tools()
+            .await
+            .map_err(|e| CliError {
+                code: ERROR_CODE_SERVER_ERROR,
+                error_type: "LIST_TOOLS_FAILED".to_string(),
+                message: format!("Failed to list tools: {}", e),
+                details: None,
+                suggestion: None,
+            })?;
 
-    Ok(tools
-        .into_iter()
-        .map(|t| {
-            let schema = serde_json::to_value(&t.input_schema).unwrap_or(serde_json::json!({}));
-            ToolInfo {
-                name: t.name.to_string(),
-                description: t.description.map(|d| d.to_string()),
-                input_schema: schema,
-            }
-        })
-        .collect())
+        Ok(tools
+            .into_iter()
+            .map(|t| {
+                let schema = serde_json::to_value(&t.input_schema).unwrap_or(serde_json::json!({}));
+                ToolInfo {
+                    name: t.name.to_string(),
+                    description: t.description.map(|d| d.to_string()),
+                    input_schema: schema,
+                }
+            })
+            .collect())
+    }).await
 }
 
 pub async fn call_tool_on_client(
@@ -114,57 +189,62 @@ pub async fn call_tool_on_client(
     tool_name: &str,
     args: serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Value, CliError> {
-    let params = CallToolRequestParams::new(tool_name.to_string()).with_arguments(args);
-    let result = client
-        .call_tool(params)
-        .await
-        .map_err(|e| CliError {
-            code: ERROR_CODE_SERVER_ERROR,
-            error_type: "CALL_TOOL_FAILED".to_string(),
-            message: format!("Call tool failed: {}", e),
-            details: None,
-            suggestion: None,
-        })?;
+    with_retry(&format!("call tool {}", tool_name), || {
+        let params = CallToolRequestParams::new(tool_name.to_string()).with_arguments(args.clone());
+        let client = client;
+        async move {
+            let result = client
+                .call_tool(params)
+                .await
+                .map_err(|e| CliError {
+                    code: ERROR_CODE_SERVER_ERROR,
+                    error_type: "CALL_TOOL_FAILED".to_string(),
+                    message: format!("Call tool failed: {}", e),
+                    details: None,
+                    suggestion: None,
+                })?;
 
-    if result.is_error == Some(true) {
-        let err_texts: Vec<String> = result
-            .content
-            .iter()
-            .filter_map(|c| {
-                let raw = &c.raw;
-                if let rmcp::model::RawContent::Text(tc) = raw {
-                    Some(tc.text.clone())
-                } else {
-                    None
+            if result.is_error == Some(true) {
+                let err_texts: Vec<String> = result
+                    .content
+                    .iter()
+                    .filter_map(|c| {
+                        let raw = &c.raw;
+                        if let rmcp::model::RawContent::Text(tc) = raw {
+                            Some(tc.text.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !err_texts.is_empty() {
+                    return Err(CliError {
+                        code: ERROR_CODE_SERVER_ERROR,
+                        error_type: "TOOL_EXECUTION_FAILED".to_string(),
+                        message: err_texts.join("\n"),
+                        details: None,
+                        suggestion: None,
+                    });
                 }
-            })
-            .collect();
-        if !err_texts.is_empty() {
-            return Err(CliError {
-                code: ERROR_CODE_SERVER_ERROR,
-                error_type: "TOOL_EXECUTION_FAILED".to_string(),
-                message: err_texts.join("\n"),
-                details: None,
-                suggestion: None,
-            });
-        }
-        return Err(CliError {
-            code: ERROR_CODE_SERVER_ERROR,
-            error_type: "TOOL_EXECUTION_FAILED".to_string(),
-            message: "Tool execution failed".to_string(),
-            details: None,
-            suggestion: None,
-        });
-    }
+                return Err(CliError {
+                    code: ERROR_CODE_SERVER_ERROR,
+                    error_type: "TOOL_EXECUTION_FAILED".to_string(),
+                    message: "Tool execution failed".to_string(),
+                    details: None,
+                    suggestion: None,
+                });
+            }
 
-    serde_json::to_value(&result)
-        .map_err(|e| CliError {
-            code: ERROR_CODE_SERVER_ERROR,
-            error_type: "SERIALIZATION_ERROR".to_string(),
-            message: format!("Failed to serialize result: {}", e),
-            details: None,
-            suggestion: None,
-        })
+            serde_json::to_value(&result)
+                .map_err(|e| CliError {
+                    code: ERROR_CODE_SERVER_ERROR,
+                    error_type: "SERIALIZATION_ERROR".to_string(),
+                    message: format!("Failed to serialize result: {}", e),
+                    details: None,
+                    suggestion: None,
+                })
+        }
+    }).await
 }
 
 pub fn get_instructions(
