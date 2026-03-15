@@ -307,7 +307,7 @@ pub async fn call_command(
 
     match connection.call_tool(tool_name, args).await {
         Ok(result) => {
-            println!("{}", format_tool_result(&result));
+            println!("{}", serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)));
             connection.close().await;
             Ok(())
         }
