@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -51,8 +52,6 @@ func connectToServer(serverName string, config *ServerConfig) (*McpConnection, e
 		nil,
 	)
 
-	var transport mcp.Transport
-
 	if config.IsHTTP() {
 		httpClient := &http.Client{}
 		if config.Timeout > 0 {
@@ -67,38 +66,57 @@ func connectToServer(serverName string, config *ServerConfig) (*McpConnection, e
 				headers: config.Headers,
 			}
 		}
-		transport = &mcp.StreamableClientTransport{
+		transport := &mcp.StreamableClientTransport{
 			Endpoint:   config.URL,
 			HTTPClient: httpClient,
 		}
-	} else {
-		cmd := exec.Command(config.Command, config.Args...)
-		// Merge process env with config env.
-		env := os.Environ()
-		for k, v := range config.Env {
-			env = append(env, fmt.Sprintf("%s=%s", k, v))
-		}
-		cmd.Env = env
-		if config.Cwd != "" {
-			cmd.Dir = config.Cwd
-		}
-		// Pipe stderr and prefix with [serverName]
-		stderrPipe, err := cmd.StderrPipe()
+
+		session, err := client.Connect(ctx, transport, nil)
 		if err != nil {
-			cmd.Stderr = os.Stderr
-		} else {
-			go func() {
-				scanner := bufio.NewScanner(stderrPipe)
-				for scanner.Scan() {
-					fmt.Fprintf(os.Stderr, "[%s] %s\n", serverName, scanner.Text())
-				}
-			}()
+			return nil, fmt.Errorf("MCP connection failed: %w", err)
 		}
-		transport = &mcp.CommandTransport{Command: cmd}
+		return &McpConnection{session: session}, nil
 	}
 
+	// stdio transport
+	cmd := exec.Command(config.Command, config.Args...)
+	env := os.Environ()
+	for k, v := range config.Env {
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	}
+	cmd.Env = env
+	if config.Cwd != "" {
+		cmd.Dir = config.Cwd
+	}
+
+	// Capture stderr for better error messages, while also streaming it.
+	var stderrMu sync.Mutex
+	var stderrLines []string
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		cmd.Stderr = os.Stderr
+	} else {
+		go func() {
+			scanner := bufio.NewScanner(stderrPipe)
+			for scanner.Scan() {
+				line := scanner.Text()
+				stderrMu.Lock()
+				stderrLines = append(stderrLines, line)
+				stderrMu.Unlock()
+				fmt.Fprintf(os.Stderr, "[%s] %s\n", serverName, line)
+			}
+		}()
+	}
+
+	transport := &mcp.CommandTransport{Command: cmd}
 	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {
+		stderrMu.Lock()
+		stderrOutput := strings.TrimSpace(strings.Join(stderrLines, "\n"))
+		stderrMu.Unlock()
+		if stderrOutput != "" {
+			return nil, fmt.Errorf("MCP connection failed: %w\n\nServer stderr:\n%s", err, stderrOutput)
+		}
 		return nil, fmt.Errorf("MCP connection failed: %w", err)
 	}
 
