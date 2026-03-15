@@ -11,12 +11,12 @@
 | 维度 | TypeScript (Bun) | Golang | 优势方 |
 |------|-------------------|--------|--------|
 | 二进制大小 (linux-x64) | **96.5 MB** | **11.2 MB** (debug) / ~7 MB (stripped) | **Golang (~8-13x 更小)** |
-| 源码行数 (不含测试) | 3,514 行 (12 文件) | 1,838 行 (6 文件) | **Golang (~48% 更少)** |
+| 源码行数 (不含测试) | 3,514 行 (12 文件) | 2,629 行 (7 文件) | **Golang (~25% 更少)** |
 | 测试代码行数 | ~661 行 (3 文件) | 1,408 行 (6 文件) | **Golang (覆盖更全)** |
 | 运行时依赖 | Bun runtime + @modelcontextprotocol/sdk | 无 (静态编译) | **Golang** |
 | 冷启动时间 | ~50-150 ms (Bun JIT) | ~1-5 ms (原生) | **Golang (~10-50x 更快)** |
 | 并发模型 | 异步 I/O (Promise) | goroutine + channel | **Golang (更轻量)** |
-| 连接池/Daemon | 有 (Unix Socket IPC) | 无 | **TypeScript (功能更全)** |
+| 连接池/Daemon | 有 (Unix Socket IPC) | 有 (Unix Socket IPC) | 持平 |
 | 跨平台构建 | 5 平台 (bun build --compile) | go build GOOS/GOARCH | 持平 |
 
 ---
@@ -65,9 +65,9 @@ Bun `--compile` 将整个 Bun 运行时打包进二进制, 导致产物偏大:
 
 Go 编译为原生机器码, 无运行时开销:
 - 冷启动: **1-5 ms**
-- 无需 Daemon 机制即可获得极快的响应
+- 同样实现了 Daemon 连接池 (daemon.go, 605 行), 但由于冷启动极快, Daemon 更多是可选的性能加分项
 
-**结论:** Golang 冷启动速度是 TypeScript 的 **10-50 倍**。TypeScript 需要额外的 Daemon 架构 (766 行代码) 来弥补启动延迟, 而 Golang 天然无此问题。
+**结论:** Golang 冷启动速度是 TypeScript 的 **10-50 倍**。TypeScript 依赖 Daemon 架构来弥补启动延迟, 而 Golang 天然无此问题。两者均已实现 Daemon 连接池。
 
 ---
 
@@ -120,7 +120,7 @@ wg.Wait()
 |------|-------------------|--------|
 | 基础内存 | ~30-50 MB (V8 堆) | ~5-10 MB |
 | 每个 MCP 连接 | ~1-3 MB | ~0.5-1 MB |
-| Daemon 进程 | 额外 30-50 MB / server | N/A |
+| Daemon 进程 | 额外 30-50 MB / server | 额外 ~5-10 MB / server |
 | GC 压力 | 较高 (V8 GC) | 较低 (Go GC, 低延迟) |
 
 **结论:** Golang 内存占用约为 TypeScript 的 **1/5 - 1/3**。当管理多个 MCP 服务器时, TypeScript 的 Daemon 架构会为每个 server 维持一个独立进程, 内存开销倍增。
@@ -133,21 +133,21 @@ wg.Wait()
 
 | 模块 | TypeScript | Golang |
 |------|------------|--------|
-| 入口 + CLI 解析 | index.ts (474 行) | main.go (300 行) |
-| MCP 客户端 | client.ts (466 行) | client.go (274 行) |
-| 配置管理 | config.ts (525 行) | config.go (382 行) |
-| 命令实现 | 4 文件 (662 行) | commands.go (401 行) |
-| 错误处理 | errors.ts (386 行) | errors.go (269 行) |
-| 输出格式化 | output.ts (230 行) | output.go (212 行) |
-| Daemon 系统 | 2 文件 (766 行) | 无 (不需要) |
+| 入口 + CLI 解析 | index.ts (474 行) | main.go (324 行) |
+| MCP 客户端 | client.ts (466 行) | client.go (312 行) |
+| 配置管理 | config.ts (525 行) | config.go (432 行) |
+| 命令实现 | 4 文件 (662 行) | commands.go (422 行) |
+| 错误处理 | errors.ts (386 行) | errors.go (320 行) |
+| 输出格式化 | output.ts (230 行) | output.go (215 行) |
+| Daemon 系统 | 2 文件 (766 行) | daemon.go (604 行) |
 | 版本 | version.ts (5 行) | 内联在 config.go |
-| **总计** | **3,514 行 / 12 文件** | **1,838 行 / 6 文件** |
+| **总计** | **3,514 行 / 12 文件** | **2,629 行 / 7 文件** |
 
 ### 分析
 
-- Golang 源码减少 **48%**, 主要因为:
-  1. **无需 Daemon 系统** (节省 766 行): Go 的冷启动足够快, 不需要连接池
-  2. **单文件命令实现** (节省 ~260 行): 所有命令集中在 commands.go
+- Golang 源码减少 **~25%**, 主要因为:
+  1. **Daemon 更简洁**: Go 的 daemon.go (604 行) 合并了 TypeScript 的 daemon.ts + daemon-client.ts (766 行) 两个文件
+  2. **单文件命令实现** (节省 ~240 行): 所有命令集中在 commands.go
   3. **语言简洁性**: Go 的结构体和接口比 TS 的类型系统更紧凑
 - Golang 测试代码 (1,408 行) 多于 TypeScript (~661 行), 覆盖更全面
 
@@ -191,19 +191,19 @@ golang.org/x/sys
 | call 命令 | Y | Y |
 | stdio 传输 | Y | Y |
 | HTTP 传输 | Y (StreamableHTTP) | Y (StreamableHTTP) |
-| 环境变量替换 | Y (递归) | Y (字段级) |
+| 环境变量替换 | Y (递归) | Y (递归) |
 | 工具过滤 (allowedTools/disabledTools) | Y | Y |
 | 重试 + 指数退避 | Y | Y |
 | 并发控制 | Y | Y |
 | ANSI 颜色输出 | Y | Y |
 | NO_COLOR 支持 | Y | Y |
 | 结构化错误消息 | Y | Y |
-| **Daemon 连接池** | **Y** | **N** |
-| **stderr 捕获** | **Y** | **N** |
+| Daemon 连接池 | Y | Y |
+| stderr 捕获 | Y | Y |
 | **自定义 HTTP headers** | Y | Y |
 | **Server instructions** | Y | Y |
 
-Golang 版本缺失 Daemon 连接池和 stderr 捕获, 但由于冷启动极快, Daemon 并非必需。
+Golang 版本已实现全部功能, 与 TypeScript 版本功能对等。
 
 ---
 
@@ -226,15 +226,13 @@ Golang 版本缺失 Daemon 连接池和 stderr 捕获, 但由于冷启动极快,
 1. **二进制体积**: 小 8-13 倍, 分发更快
 2. **启动速度**: 快 10-50 倍, 无需 Daemon 补偿
 3. **内存占用**: 约 1/5, 资源友好
-4. **代码简洁**: 少 48% 代码量, 维护成本低
+4. **代码简洁**: 少 ~25% 代码量, 功能完全对等, 维护成本低
 5. **零依赖运行**: 静态链接, 无需运行时
 6. **测试覆盖**: 测试代码更多, 质量保障更好
 
 ### TypeScript 版本优势
-1. **Daemon 连接池**: 对重复调用有缓存优势 (但仅在多次连续调用同一 server 时有效)
-2. **stderr 捕获**: 更好的调试体验
-3. **生态成熟**: Bun/Node.js 生态庞大, 扩展方便
-4. **开发效率**: TypeScript 类型推导和工具链成熟
+1. **生态成熟**: Bun/Node.js 生态庞大, 扩展方便
+2. **开发效率**: TypeScript 类型推导和工具链成熟
 
 ### 结论
 
@@ -243,4 +241,4 @@ Golang 版本缺失 Daemon 连接池和 stderr 捕获, 但由于冷启动极快,
 - 运维成本: 零依赖 + 低内存 = 更适合 CI/CD 和容器环境
 - 代码质量: 更少的代码 + 更多的测试 = 更易维护
 
-TypeScript 版本的 Daemon 机制是一个巧妙的工程设计, 但本质上是在弥补运行时的先天劣势。Golang 用更少的代码实现了相同的功能, 同时在所有性能指标上均有显著优势。
+Golang 版本已实现与 TypeScript 完全对等的功能 (包括 Daemon 连接池和 stderr 捕获), 同时在所有性能指标上均有显著优势。TypeScript 版本的 Daemon 机制是一个巧妙的工程设计, 但 Golang 天然的冷启动优势使得 Daemon 并非必需, 只是作为可选的性能加分项。
